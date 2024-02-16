@@ -249,12 +249,22 @@ int ev3_tank_on(int _l_pwr, int _r_pwr)
 
 /**
  * @fne タンク関数(停止)
- * @param ブレーキ有無(true = brake)
+ * @param ブレーキタイプ
  */
-int ev3_tank_stop(bool_t brake)
+int ev3_tank_stop(brake_t brake)
 {
-  ev3_motor_stop(_MtrL, brake);
-  return ev3_motor_stop(_MtrR, brake);
+  bool_t tmp = brake;
+  ER ercd;
+  if (brake == STOP_NOHOLD)
+    tmp = true;
+  ev3_motor_stop(_MtrL, tmp);
+  ercd = ev3_motor_stop(_MtrR, tmp);
+
+  if (brake == STOP_NOHOLD) {
+    tslp_tsk(200*MSEC);
+    ev3_motor_stop(_MtrL, false);
+    ercd = ev3_motor_stop(_MtrR, false);
+  }
+  return ercd;
 }
 
-//$Log:$

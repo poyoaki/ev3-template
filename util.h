@@ -62,7 +62,7 @@
 
 typedef enum {
   STOP_FREE = 0,
-  STOP_BREAK = 1,
+  STOP_BRAKE = 1,
   STOP_NOHOLD = 2
 } brake_t;
 
@@ -89,7 +89,7 @@ int ev3_tank_rot(int _l_pwr, int _r_pwr, float l_rot, float r_rot);
 int ev3_tank_on(int _l_pwr, int _r_pwr);
 
 // ステアリングモーターの停止
-int ev3_tank_stop(bool_t brake);
+int ev3_tank_stop(brake_t brake);
 #ifndef ev3_steering_stop
 // ev3_steering_stopという関数コールにもできる。
 # define ev3_steering_stop ev3_tank_stop
