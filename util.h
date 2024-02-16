@@ -66,7 +66,12 @@ typedef enum {
   STOP_NOHOLD = 2
 } brake_t;
 
-int limit_100(int val);
+
+// LCDデバッグ用printf
+void ev3_printf(const char *fmt, ...);
+
+// 行指定版printf
+void ev3_printf_locate(unsigned char line, const char *fmt, ...);
 
 // ステアリング用モーター登録関数
 void ev3_steering_register(motor_port_t mtr1, motor_port_t mtr2);

@@ -9,9 +9,85 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "util.h"
 
 static motor_port_t _MtrL, _MtrR;
+
+static int _Lcd_y;
+static bool_t _Lcd_init = false;
+
+void ev3_printf_init(void)
+{
+  ev3_lcd_set_font(EV3_FONT_MEDIUM);
+  _Lcd_y = 0;
+  _Lcd_init = true;
+}
+/**
+ * @fn 178x128サイズのLCDに、さみだれ式に文字を表示する。1コール毎に改行する。
+ * フォントサイズは
+ * @param printfと同じ
+ * font_small: 6x8  font_medium: 10x16 -> 最大17文字。
+ */
+void ev3_printf(const char *fmt, ...)
+{
+  char tmp[200];
+  va_list args;
+  int len;
+  va_start(args, fmt);
+  len = vsprintf(tmp, fmt, args);
+  va_end(args);
+  if (len < 18){
+    int i;
+    for (i=len; i<18; i++) {
+      tmp[i] = ' ';
+    }
+    tmp[i] = '\0';
+  }
+    
+  if (! _Lcd_init) {
+    ev3_printf_init();
+  }
+  
+  ev3_lcd_draw_string (tmp, 0, _Lcd_y);
+  _Lcd_y += 16;
+  if (_Lcd_y > 127-10)
+    _Lcd_y = 0;
+}
+
+/**
+ * @fn 178x128サイズのLCDに、行指定で文字を表示する。
+ * フォントサイズは
+ * @param 行数（0 to 10), printfと同じ
+ * font_small: 6x8  font_medium: 10x16 -> 最大17文字。
+ */
+void ev3_printf_locate(unsigned char line, const char *fmt, ...)
+{
+  char tmp[200];
+  va_list args;
+  int len;
+  if (line > 10)
+    line = 10;
+  
+  va_start(args, fmt);
+  len = vsprintf(tmp, fmt, args);
+  va_end(args);
+  
+  if (len < 18){
+    int i;
+    for (i=len; i<18; i++) {
+      tmp[i] = ' ';
+    }
+    tmp[i] = '\0';
+  }
+
+  if (! _Lcd_init) {
+    ev3_printf_init();
+  }
+  
+  ev3_lcd_draw_string (tmp, 0, line*16);
+}
+
 
 /**
  * @fn －100～100に数値を補正する
