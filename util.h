@@ -43,10 +43,38 @@
 #ifndef __UTIL_H__
 #define __UTIL_H__
 
+// 片方だけ有効にする
+#define UTIL_EV3
+//#define UTIL_SPIKE
 #pragma once
-#include "ev3api.h"
 
+#ifdef UTIL_SPIKE
+# include "spikeapi.h"
+#else
+# include "ev3api.h"
+#endif
 #include <stdio.h>
+
+/*************************************
+  【重要】
+  spike_printfは、USBがPCと繋がっていないとそこでハブがUSBの接続待ちになってしまう。
+  ※ 一見暴走のように見える。
+
+  そのため、USBを繋がないときには下の#defineを有効にしておき、spike_printfの中身を空にすること。
+ *********************************** */
+//#define NO_SPIKE_PRINTF
+
+#ifdef UTIL_EV3
+// EV3 LCDデバッグ用printf
+void ev3_printf(const char *fmt, ...);
+// EV3 LCD 行指定版printf
+void ev3_printf_locate(unsigned char line, const char *fmt, ...);
+#else
+// Spike USB-シリアル デバッグ用printf
+// #defineNO_SPIKE_PRINTF が有効なときは、カラ関数になる
+void spike_printf(const char *fmt, ...);
+#endif
+
 
 /**
  * dly_tsk/tslp_tsk用の時間定義
@@ -54,12 +82,11 @@
  *     dly_tsk(5*SEC) -> 5sec sleep
  *     tslp_tsk(3*SEC) -> 3sec sleep
  */
-#define MSEC 1000
-#define USEC 1
-#define SEC 1000000
+# define MSEC 1000
+# define USEC 1
+# define SEC 1000*1000
 
 // Utils
-
 typedef enum {
   STOP_FREE = 0,
   STOP_BRAKE = 1,
@@ -67,34 +94,73 @@ typedef enum {
 } brake_t;
 
 
-// LCDデバッグ用printf
-void ev3_printf(const char *fmt, ...);
+/********************************
+ 疑似台形移動（減速をしてより正確に移動）の設定
+ #define GIJI_DAIKEI_IDOUを有効にしておくと
+ 最初の90％を通常速度、残りをパワー20でゆっくり回転角度（回転数）に合わせに行く
+ *********************************/
+# define GIJI_DAIKEI_IDOU   
 
-// 行指定版printf
-void ev3_printf_locate(unsigned char line, const char *fmt, ...);
+/********************************************
+ モーターペア関数
+ EV3のステアリング・タンク同様に使える。
+ 停止時のブレーキ（回転角度保持）または惰性回転は、
+ ステアリング回転数（角度）と
+ ブレーキ関数で指定する。
+ *******************************************/
 
-// ステアリング用モーター登録関数
-void ev3_steering_register(motor_port_t mtr1, motor_port_t mtr2);
-
-// 回転数のステアリング
-int ev3_steering_rot(int _pwr, int _steer, float rot, brake_t brake);
-
-// ステアリング・オン
-int ev3_steering_on(int _pwr, int _steer);
-
-// 回転数のタンク
-int ev3_tank_rot(int _l_pwr, int _r_pwr, float l_rot, float r_rot);
-
-// タンク・オン
-int ev3_tank_on(int _l_pwr, int _r_pwr);
-
-// ステアリングモーターの停止
-int ev3_tank_stop(brake_t brake);
-#ifndef ev3_steering_stop
-// ev3_steering_stopという関数コールにもできる。
-# define ev3_steering_stop ev3_tank_stop
+// 最初に登録を行い、モーターペアの接続ポートを指定する。
+// （ポートが間違っていると、Spikeの場合は救急車の音が出る）
+#ifdef UTIL_EV3
+ // EV3 ステアリング用モーター登録関数
+void steering_register(motor_port_t mtr1, motor_port_t mtr2);
+#endif
+#ifdef UTIL_SPIKE
+// Spike ステアリング用モーター登録関数
+void steering_register(pbio_port_id_t mtr1, pbio_port_id_t mtr2);
 #endif
 
+// ステアリング
+int steering_rot( int _steer, int _pwr, float rot, brake_t brake);
+int steering_degree( int _steer, int _pwr, int degree, brake_t brake);
 
+// ステアリング・オン
+int steering_on( int _steer, int _pwr);
+
+// タンク
+int tank_rot(int _l_pwr, int _r_pwr, float rot);
+int tank_degree(int _l_pwr, int _r_pwr, int deg);
+
+// タンク・オン
+int tank_on(int _l_pwr, int _r_pwr);
+
+// ステアリングモーターの停止
+int tank_stop(brake_t brake);
+#ifndef steering_stop
+// steering_stopという関数コールにもできる。
+# define steering_stop tank_stop
+#endif
+
+/**
+ * @fn バッテリー確認、LEDの最初の行に表示する
+ * @param なし
+ */
+void disp_battery(void);
+
+
+// カラーセンサーの接続設定を行う
+int color_sensor_init(void);
+
+#ifdef UTIL_SPIKE
+/*
+  @fn SPIKE専用 RGB検出版 色チェック
+  @param 検出したいポート番号
+ */
+bool is_red(pbio_port_id_t sensor);
+bool is_blue(pbio_port_id_t sensor);
+
+/* PD制御によるライントレースのサンプル 停止条件は色 'R' 'B' のいずれか*/
+void inetrace_single(pbio_port_id_t sensor, int speed, char _color);
+#endif
 
 #endif

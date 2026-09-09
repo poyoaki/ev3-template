@@ -18,8 +18,8 @@
  */
 void main_task(intptr_t unused) 
 {
-   ev3_lcd_set_font(EV3_FONT_MEDIUM) ;
-   ev3_lcd_draw_string ("Template Program", 10, 10);
+  ev3_lcd_set_font(EV3_FONT_MEDIUM) ;
+  ev3_lcd_draw_string ("Template Program", 10, 10);
 
   // printfのテストプログラム
 #if 0
@@ -32,58 +32,81 @@ void main_task(intptr_t unused)
   }
 #endif
 
+// (1) ステアリング用モーターを登録する
+  if (ev3_motor_config(EV3_PORT_B , MEDIUM_MOTOR) != E_OK) {
+    ev3_printf("PORT LEFT Conn ERR");
+    return;
+  }
+  if (ev3_motor_config(EV3_PORT_C , MEDIUM_MOTOR) != E_OK) {
+    ev3_printf("PORT RIGHT Conn ERR");
+    return;
+  }
+
+  steering_register(EV3_PORT_B, EV3_PORT_C);
+  // カラーセンサーの登録
+  color_sensor_init();
   /*
    * ステアリングユーティリティーのテストプログラム
    */
   
-  // (1) ステアリング用モーターを登録する
-  if (ev3_motor_config(EV3_PORT_B , LARGE_MOTOR) != E_OK) {
-    ev3_lcd_draw_string ("PORT B Conn ERR", 0, 20);
-    return;
-  }
-  if (ev3_motor_config(EV3_PORT_C , LARGE_MOTOR) != E_OK) {
-    ev3_lcd_draw_string ("PORT C Conn ERR", 0, 20);
-    return;
-  }
-  ev3_steering_register(EV3_PORT_B, EV3_PORT_C);
-
-  // カラーセンサーの登録
-  ev3_sensor_config(EV3_PORT_3, COLOR_SENSOR);
-
   // (2) 動作テスト
-#if 0
+#if 1
   // 直進、左折、後退
-  ev3_steering_rot(50, 0, 1, STOP_NOHOLD);
-  tslp_tsk(500*MSEC);
-  ev3_tank_rot(-50, 50, 0.5, 0.5);
-  tslp_tsk(1*SEC);
-  ev3_steering_rot(50, 0, -1, true);
+  while(1){
+  steering_rot(0, 50, 1, STOP_NOHOLD);
+//  tslp_tsk(500*MSEC);
+//  tank_rot(-50, 50, 0.5);
+//  tslp_tsk(1*SEC);
+//  steering_rot(0, 50, -1, STOP_BRAKE);
+    dly_tsk(1*SEC);
+  }
 #endif
 #if 0
   // 右大回り、左大回り、斜め右ステア、斜め左ステア
-  ev3_tank_rot(50, 0, 1, 0);
+  tank_rot(50, 0, 1);
   tslp_tsk(500*MSEC);
-  ev3_tank_rot(0, 50, 0, 1);
+  tank_rot(0, 50, 1);
   tslp_tsk(500*MSEC);
-  ev3_steering_rot(50, 20, 2, STOP_FREE);
-  ev3_steering_rot(70, -20, 2, STOP_NOHOLD);
+  steering_rot(20, 50, 2, STOP_FREE);
+  steering_rot(-20, 70, 2, STOP_NOHOLD);
 #endif
+
 #if 0
-  // ライントレースのテスト
-  while(1) {
-    if (ev3_color_sensor_get_reflect(EV3_PORT_3) < 50) {
-      ev3_steering_on(40, 20);
+  // 黒線ライントレースのテスト
+  while(1) 
+  {
+    ref = ev3_color_sensor_get_reflect(EV3_PORT_3);
+    ev3_printf_locate(0, "ref:%03d", ref);
+    if (ref < 50) {
+      steering_on(30, 30);
     }
     else {
-      ev3_steering_on(40, -20);
+      steering_on(-20, 30);
     }
     if (ev3_color_sensor_get_color(EV3_PORT_3) == COLOR_RED)
       break;
   }
-  ev3_steering_stop(STOP_NOHOLD);
+  steering_stop(STOP_NOHOLD);
   
 #endif
+
+#if 0
+  // 赤線ライントレースのテスト
+  while(1) {
+    rgb_raw_t raw;
+    ev3_printf_locate(0, "r%03d g%03d b%03d", raw.r, raw.g, raw.b);
+    ev3_color_sensor_get_rgb_raw(EV3_PORT_3, &raw);
+    if (raw.g < 230) {
+      steering_on(30, 30);
+    }
+    else {
+      steering_on(-20, 30);
+    }
+  }
+  steering_stop(STOP_NOHOLD);
   
+#endif
+
   return;
 }
 
