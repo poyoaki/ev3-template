@@ -193,11 +193,54 @@ int limit_abs(int val, int lim)
                       (stuck/slipping wheel safety net -- without
                       this, a wheel that never reaches the cruise
                       target keeps the loop spinning forever)
+  SYNC_KP           : while driving (both wheels commanded the same
+                      power, e.g. steer=0), proportional gain that
+                      turns the L/R encoder GAP[deg] (accumulated
+                      position error, effectively an integral of the
+                      speed error) into a power correction[%%] --
+                      corrects a steady bias, but only after it has
+                      already built up some position gap
+  SYNC_KD           : gain that turns the L/R speed DIFFERENCE[deg
+                      per SYNC_SPEED_WINDOW ticks] into a power
+                      correction[%%] -- reacts to a developing
+                      mismatch immediately, before SYNC_KP's gap even
+                      appears, which is what actually keeps the two
+                      wheels' speed equal while driving instead of
+                      just resyncing their position after the fact
+  SYNC_SPEED_WINDOW : how many loop iterations (x10ms) to measure the
+                      speed difference over -- 1 tick is too short:
+                      a small speed mismatch rounds to a 0-degree
+                      difference at 10ms and the D-term sees nothing
+                      but quantization noise
+  SYNC_MAX_CORR     : cap on the total (P+D) correction[%%], so a
+                      single bad reading can't kick power around too
+                      hard
+  EARLY_SYNC_DEG    : for the first this many degrees of travel,
+                      static friction/backlash means the two wheels
+                      may not break free from a dead stop at exactly
+                      the same instant -- a one-time heading kick that
+                      SYNC_KP/SYNC_KD (which only react to an ongoing
+                      gap once both wheels are already moving) can't
+                      undo. Below this distance, whichever wheel gets
+                      ahead by more than EARLY_SYNC_TOLERANCE is held
+                      at 0 power until the other one catches up.
+  EARLY_SYNC_TOLERANCE : allowed gap[deg] before the early hold-back
+                      above kicks in
  *******************************************/
 # define EV3_RAMP_DEG      60
 # define EV3_START_PWR     25
 # define EV3_CRUISE_PCT    70
 # define EV3_STALL_TIMEOUT (1*SEC)
+# define SYNC_KP           0.6f
+# define SYNC_KD           1.5f
+# define SYNC_SPEED_WINDOW 5
+# define SYNC_MAX_CORR     20
+# define EARLY_SYNC_DEG       15
+# define EARLY_SYNC_TOLERANCE 2
+
+// 実機の左右モーターの個体差(ハードウェアのバラツキ)を補正する固定
+// オフセット。steer=0の直進時、左を-LR_BARANCE/2、右を+LR_BARANCE/2する。
+# define LR_BARANCE        2
 #endif
 
 /*******************************************
@@ -342,7 +385,7 @@ static void ev3_p_stop2(int target_l, int max_l_pwr, int target_r, int max_r_pwr
    (GIJI_DAIKEI_IDOU有効時。無効なら100%)まで走らせる。l_pwr/r_pwrは
    呼び出し側の意図した符号のまま使う(steering_degreeのl_signのような
    鏡写し補正はしない。既存のev3_motor_rotate版もしていなかった)。 */
-static void ev3_ramp_drive(int l_pwr, int r_pwr, int cruise_deg, int l_sign)
+static void ev3_ramp_drive(int l_pwr, int r_pwr, int cruise_deg, int l_sign, int sync)
 {
   int stop = false;
   int abs_l = abs(l_pwr), abs_r = abs(r_pwr);
@@ -352,6 +395,7 @@ static void ev3_ramp_drive(int l_pwr, int r_pwr, int cruise_deg, int l_sign)
   int r_start = (EV3_START_PWR < abs_r) ? EV3_START_PWR : abs_r;
   int ramp_deg = EV3_RAMP_DEG;
   int last_l = -1, last_r = -1;
+  int speed_prev_l = 0, speed_prev_r = 0, speed_tick = 0, speed_diff = 0;
   SYSTIM l_t, r_t, t_now;
   if (ramp_deg > cruise_deg / 2)
     ramp_deg = cruise_deg / 2;
@@ -398,6 +442,52 @@ static void ev3_ramp_drive(int l_pwr, int r_pwr, int cruise_deg, int l_sign)
       cur_l = abs_l;
     if (cur_r > abs_r)
       cur_r = abs_r;
+    // 走行中も左右のズレを見てパワー配分を微調整する(直進/その場スピン、
+    // つまり左右同じパワーを指定したときだけ)。モーターの個体差で
+    // 同じパワーでも速度が揃わないと、途中は斜めに進んで最終的に
+    // ev3_p_stop2()の補正だけで正面に戻る形になってしまうため、進み
+    // すぎている側を弱め遅れている側を強めて、走行中から真っすぐ
+    // 進むようにする。l_pwr/r_pwrが異なる(円弧移動)ときは、そもそも
+    // 左右が同じ速度になるのが正しくないので対象外にする。
+    if (sync) {
+      if (l_cnt < EARLY_SYNC_DEG || r_cnt < EARLY_SYNC_DEG) {
+        // 起動直後は、個体差による動き出しのタイミングのズレが
+        // ロボットの向きのズレとしてそのまま残ってしまう。ここだけは
+        // 比例補正で「弱める」のではなく、進んでいる方を完全に
+        // 足止めして遅れている方が追いつくのを待つ。
+        if (l_cnt - r_cnt > EARLY_SYNC_TOLERANCE)
+          cur_l = 0;
+        else if (r_cnt - l_cnt > EARLY_SYNC_TOLERANCE)
+          cur_r = 0;
+      } else {
+        int diff = l_cnt - r_cnt;
+        int corr;
+        // SYNC_SPEED_WINDOW周期ごとに直近の「進んだ量」の差(=速度差)を
+        // 測る。1周期(10ms)だと角度が整数度でしか取れないため、小さな
+        // 速度差はまるめで消えてノイズにしかならない。
+        if (++speed_tick >= SYNC_SPEED_WINDOW) {
+          speed_diff = (l_cnt - speed_prev_l) - (r_cnt - speed_prev_r);
+          speed_prev_l = l_cnt;
+          speed_prev_r = r_cnt;
+          speed_tick = 0;
+        }
+        corr = (int)(diff * SYNC_KP + speed_diff * SYNC_KD);
+        if (corr > SYNC_MAX_CORR)
+          corr = SYNC_MAX_CORR;
+        else if (corr < -SYNC_MAX_CORR)
+          corr = -SYNC_MAX_CORR;
+        cur_l -= corr / 2;
+        cur_r += corr / 2;
+        if (cur_l < 0)
+          cur_l = 0;
+        else if (cur_l > abs_l)
+          cur_l = abs_l;
+        if (cur_r < 0)
+          cur_r = 0;
+        else if (cur_r > abs_r)
+          cur_r = abs_r;
+      }
+    }
     ev3_motor_set_power(_MtrL, l_sign * lp_sign * cur_l);
     ev3_motor_set_power(_MtrR, rp_sign * cur_r);
     // set_powerを連呼するタイトループが他タスク(モーターへの実際の
@@ -480,6 +570,17 @@ int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
     l_pwr = limit_abs(pwr - diff, pwr);
   }
 
+#ifdef UTIL_EV3
+  // 直進時のみ、左右モーターの個体差を固定オフセットで補正する。
+  // steer==0のときl_pwr/r_pwrはどちらもpwrちょうどなので、+側は
+  // limit_abs(_, pwr)ではクランプされて効果が消えてしまう。ここは
+  // 意図的な微調整なのでlimit_100で-100～100の範囲だけ守る。
+  if (steer == 0) {
+    l_pwr = limit_100(l_pwr - LR_BARANCE / 2);
+    r_pwr = limit_100(r_pwr + LR_BARANCE / 2);
+  }
+#endif
+
   abs_degree = abs(deg);
 #ifdef UTIL_SPIKE
   // 回転角度のリセット
@@ -528,7 +629,7 @@ int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
     // 2回コールしても左右が同期せず、立ち上がりの個体差でわずかに
     // 曲がってしまう。SPIKE版と同じ(1)ゆっくり立ち上がる(2)指定パワーで
     // 巡航(3)P制御で追い込む、の3段階を共通のev3_ramp_drive()で行う。
-    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, l_sign);
+    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, l_sign, 1);
     ev3_printf("ramp end");
     // (3) 後処理。P制御で目標角度(±1度)まで追い込む。
     ev3_p_stop2(target_l, l_pwr, target_r, r_pwr, l_sign, brake);
@@ -689,7 +790,7 @@ int tank_degree(int _l_pwr, int _r_pwr, int degree)
     p_stop2(target_l, l_pwr, target_r, r_pwr, STOP_BRAKE);
 #else
     // EV3: (1)ゆっくり立ち上がる (2)指定パワーで巡航 (3)P制御で追い込む。
-    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, 1);
+    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, 1, 1);
     ev3_p_stop2(target_l, l_pwr, target_r, r_pwr, 1, STOP_BRAKE);
 #endif
   }
@@ -720,7 +821,7 @@ int tank_degree(int _l_pwr, int _r_pwr, int degree)
     p_stop2(target_l, l_pwr, target_r, r_pwr, STOP_BRAKE);
 #else
     // EV3: (1)ゆっくり立ち上がる (2)指定パワーで巡航 (3)P制御で追い込む。
-    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, 1);
+    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, 1, 0);
     ev3_p_stop2(target_l, l_pwr, target_r, r_pwr, 1, STOP_BRAKE);
 #endif
   }
