@@ -109,6 +109,7 @@ void ev3_printf(const char *fmt, ...)
   _Lcd_y += 16;
   if (_Lcd_y > 127-10)
     _Lcd_y = 0;
+    //ev3_lcd_fill_rect(0,0,178,128,EV3_LCD_WHITE);
 }
 
 /**
@@ -171,21 +172,54 @@ int limit_abs(int val, int lim)
   return val;
 }
 
-#ifdef UTIL_SPIKE
+#ifdef UTIL_EV3
+/*******************************************
+ steering_degree()/tank_degree() ramp-drive (EV3).
+ ev3_motor_rotate()/ev3_motor_steer() drive the motors with
+ their own built-in control loop, uncoordinated between the
+ two wheels, so calling them independently lets the robot
+ veer slightly during the initial acceleration burst. Driving
+ both wheels ourselves via ev3_motor_set_power(), starting
+ slow and ramping up, avoids that burst; the final approach
+ is handed off to the shared P control (ev3_p_stop2).
+  EV3_RAMP_DEG     : distance[deg] over which power ramps up
+  EV3_START_PWR    : starting power[%] at the ramp's beginning
+  EV3_CRUISE_PCT   : cruise ends at this %% of the target angle;
+                      the rest is left for ev3_p_stop2() so it
+                      has room to decelerate smoothly instead of
+                      correcting a large overshoot
+  EV3_STALL_TIMEOUT : if a wheel makes literally zero progress
+                      for this long[us], the ramp gives up on it
+                      (stuck/slipping wheel safety net -- without
+                      this, a wheel that never reaches the cruise
+                      target keeps the loop spinning forever)
+ *******************************************/
+# define EV3_RAMP_DEG      60
+# define EV3_START_PWR     25
+# define EV3_CRUISE_PCT    70
+# define EV3_STALL_TIMEOUT (1*SEC)
+#endif
+
 /*******************************************
  P control gains used to converge the wheel
  angle onto the target after the coarse (bang-bang)
  approach phase. Tune P_KP / P_MIN_PWR on the
- actual robot to hit +-1 degree.
+ actual robot to hit +-1 degree. Shared by both
+ platforms; the motor-API-specific finisher
+ (p_stop2 / ev3_p_stop2) below uses it.
   P_KP        : proportional gain, [deg] error -> [%] power
   P_MIN_PWR   : minimum power needed to overcome
                 the robot's own weight/friction
   P_TOLERANCE : error considered "arrived" [deg]
+  P_TIMEOUT   : abort if the error hasn't gotten any smaller for
+                this long [us] (a stall/oscillation safety net --
+                NOT a cap on how long the whole approach may take,
+                since that legitimately varies with distance/power)
  *******************************************/
 # define P_KP        0.5f
 # define P_MIN_PWR   15
 # define P_TOLERANCE 1
-# define P_TIMEOUT   (1*SEC)  // shuusoku shinai baai no anzen timeout [us]
+# define P_TIMEOUT   (1*SEC)
 
 /* Convert a remaining-angle error into a motor power command.
    Saturates at +-max_pwr, and is floored at +-P_MIN_PWR so the
@@ -198,13 +232,20 @@ static int p_power(int err, int max_pwr)
     pwr = limit;
   else if (pwr < -limit)
     pwr = -limit;
-  else if (pwr > 0 && pwr < P_MIN_PWR)
-    pwr = P_MIN_PWR;
-  else if (pwr < 0 && pwr > -P_MIN_PWR)
-    pwr = -P_MIN_PWR;
+  else if (abs(err) > P_TOLERANCE * 3) {
+    // ごく近距離ではP_MIN_PWRの下駄を履かせない。誤差が小さいのに
+    // 無理やり最低出力まで持ち上げると、目標を追い越してすぐ逆方向にも
+    // 同じだけ持ち上げ…を繰り返し、いつまでも収束しない振動(タイヤが
+    // 小刻みに震えて止まって見える)に陥るため。
+    if (pwr > 0 && pwr < P_MIN_PWR)
+      pwr = P_MIN_PWR;
+    else if (pwr < 0 && pwr > -P_MIN_PWR)
+      pwr = -P_MIN_PWR;
+  }
   return pwr;
 }
 
+#ifdef UTIL_SPIKE
 /* Servo motorL/motorR onto target_l/target_r [deg] (signed, relative
    to the last pup_motor_reset_count()) using P control, then apply
    the requested brake mode. max_l_pwr/max_r_pwr are the powers that
@@ -213,15 +254,29 @@ static int p_power(int err, int max_pwr)
 static void p_stop2(int target_l, int max_l_pwr, int target_r, int max_r_pwr, brake_t brake)
 {
   int l_err, r_err;
-  SYSTIM t0, t1;
-  get_tim(&t0);
+  int best_l = -1, best_r = -1;
+  SYSTIM l_t, r_t, t_now;
+  get_tim(&l_t);
+  r_t = l_t;
   do {
     l_err = target_l - pup_motor_get_count(motorL);
     r_err = target_r - pup_motor_get_count(motorR);
     pup_motor_set_power(motorL, p_power(l_err, max_l_pwr));
     pup_motor_set_power(motorR, p_power(r_err, max_r_pwr));
-    get_tim(&t1);
-  } while ((abs(l_err) > P_TOLERANCE || abs(r_err) > P_TOLERANCE) && (SYSTIM)(t1 - t0) < P_TIMEOUT);
+    // 各輪の誤差を別々に追跡する。片方の誤差だけ縮んでいると、合計値
+    // では動かなくなったもう片方(スタック)を見逃してしまうため。
+    get_tim(&t_now);
+    if (best_l < 0 || abs(l_err) < best_l) {
+      best_l = abs(l_err);
+      l_t = t_now;
+    }
+    if (best_r < 0 || abs(r_err) < best_r) {
+      best_r = abs(r_err);
+      r_t = t_now;
+    }
+    if ((SYSTIM)(t_now - l_t) > P_TIMEOUT || (SYSTIM)(t_now - r_t) > P_TIMEOUT)
+      break;
+  } while (abs(l_err) > P_TOLERANCE || abs(r_err) > P_TOLERANCE);
 
   spike_printf("p_stop2 err L:%d R:%d\n", l_err, r_err);
 
@@ -235,6 +290,120 @@ static void p_stop2(int target_l, int max_l_pwr, int target_r, int max_r_pwr, br
       pup_motor_hold(motorL);
       pup_motor_hold(motorR);
     }
+  }
+}
+#else
+/* Mモーターでのステアリングは左右が鏡写しの取り付けになるため、
+   ev3_motor_steerが内部でやっているのと同じく、l_signで左モーター
+   だけ符号を反転してから読み書きする。l_sign/target_l/target_rは
+   既にその補正込みの「論理的に+が前進」の値として渡すこと。 */
+static void ev3_p_stop2(int target_l, int max_l_pwr, int target_r, int max_r_pwr, int l_sign, brake_t brake)
+{
+  int l_err, r_err;
+  int ev3_brake = (brake == STOP_BRAKE);
+  int best_l = -1, best_r = -1;
+  SYSTIM l_t, r_t, t_now;
+  get_tim(&l_t);
+  r_t = l_t;
+  ev3_printf("stop2");
+  do {
+    l_err = target_l - l_sign * ev3_motor_get_counts(_MtrL);
+    r_err = target_r - ev3_motor_get_counts(_MtrR);
+    ev3_motor_set_power(_MtrL, l_sign * p_power(l_err, max_l_pwr));
+    ev3_motor_set_power(_MtrR, p_power(r_err, max_r_pwr));
+    // 各輪の誤差を別々に追跡する。片方の誤差だけ縮んでいると、合計値
+    // では動かなくなったもう片方(スタック)を見逃してしまうため。
+    get_tim(&t_now);
+    if (best_l < 0 || abs(l_err) < best_l) {
+      best_l = abs(l_err);
+      l_t = t_now;
+    }
+    if (best_r < 0 || abs(r_err) < best_r) {
+      best_r = abs(r_err);
+      r_t = t_now;
+    }
+    if ((SYSTIM)(t_now - l_t) > P_TIMEOUT || (SYSTIM)(t_now - r_t) > P_TIMEOUT)
+      break;
+    // set_powerを連呼するタイトループが他タスクを飢餓状態にしないよう、
+    // 毎周期少しCPUを譲る。
+    dly_tsk(10*MSEC);
+  } while (abs(l_err) > P_TOLERANCE || abs(r_err) > P_TOLERANCE);
+
+  ev3_printf("p_st2 L:%d R:%d", l_err, r_err);
+
+  ev3_motor_stop(_MtrL, ev3_brake);
+  ev3_motor_stop(_MtrR, ev3_brake);
+}
+#endif
+
+#ifdef UTIL_EV3
+/* tank_degree()のEV3粗動フェーズ。各輪を自分のエンコーダ量に応じて
+   EV3_START_PWRから指定パワーまでランプさせながら、指定角度の70%
+   (GIJI_DAIKEI_IDOU有効時。無効なら100%)まで走らせる。l_pwr/r_pwrは
+   呼び出し側の意図した符号のまま使う(steering_degreeのl_signのような
+   鏡写し補正はしない。既存のev3_motor_rotate版もしていなかった)。 */
+static void ev3_ramp_drive(int l_pwr, int r_pwr, int cruise_deg, int l_sign)
+{
+  int stop = false;
+  int abs_l = abs(l_pwr), abs_r = abs(r_pwr);
+  int lp_sign = (l_pwr >= 0) ? 1 : -1;
+  int rp_sign = (r_pwr >= 0) ? 1 : -1;
+  int l_start = (EV3_START_PWR < abs_l) ? EV3_START_PWR : abs_l;
+  int r_start = (EV3_START_PWR < abs_r) ? EV3_START_PWR : abs_r;
+  int ramp_deg = EV3_RAMP_DEG;
+  int last_l = -1, last_r = -1;
+  SYSTIM l_t, r_t, t_now;
+  if (ramp_deg > cruise_deg / 2)
+    ramp_deg = cruise_deg / 2;
+  if (ramp_deg < 1)
+    ramp_deg = 1;
+
+  get_tim(&l_t);
+  r_t = l_t;
+  while (!stop) {
+    int l_cnt = abs(ev3_motor_get_counts(_MtrL));
+    int r_cnt = abs(ev3_motor_get_counts(_MtrR));
+    int l_ramp, r_ramp, cur_l, cur_r;
+    if (l_cnt >= cruise_deg || r_cnt >= cruise_deg) {
+      stop = true;
+      break;
+    }
+    // 各輪を別々に見て、動かすはずの輪(パワー0でない)が一定時間まったく
+    // 進んでいなければスタック(スリップ/引っかかり)とみなして打ち切る。
+    // 左右の合計で見ると、片方が正常に進んでいる間はもう片方が本当に
+    // 止まっていても見逃してしまうため、必ず輪ごとに判定する。
+    // パワー0の輪(意図的に静止させている)は対象外。
+    get_tim(&t_now);
+    if (l_cnt > last_l) {
+      last_l = l_cnt;
+      l_t = t_now;
+    } else if (abs_l > 0 && (SYSTIM)(t_now - l_t) > EV3_STALL_TIMEOUT) {
+      ev3_printf("ramp stall L:%d R:%d", l_cnt, r_cnt);
+      stop = true;
+      break;
+    }
+    if (r_cnt > last_r) {
+      last_r = r_cnt;
+      r_t = t_now;
+    } else if (abs_r > 0 && (SYSTIM)(t_now - r_t) > EV3_STALL_TIMEOUT) {
+      ev3_printf("ramp stall L:%d R:%d", l_cnt, r_cnt);
+      stop = true;
+      break;
+    }
+    l_ramp = (l_cnt < ramp_deg) ? l_cnt : ramp_deg;
+    r_ramp = (r_cnt < ramp_deg) ? r_cnt : ramp_deg;
+    cur_l = l_start + (abs_l - l_start) * l_ramp / ramp_deg;
+    cur_r = r_start + (abs_r - r_start) * r_ramp / ramp_deg;
+    if (cur_l > abs_l)
+      cur_l = abs_l;
+    if (cur_r > abs_r)
+      cur_r = abs_r;
+    ev3_motor_set_power(_MtrL, l_sign * lp_sign * cur_l);
+    ev3_motor_set_power(_MtrR, rp_sign * cur_r);
+    // set_powerを連呼するタイトループが他タスク(モーターへの実際の
+    // 送信を担う下位優先度タスクなど)を飢餓状態にしないよう、毎周期
+    // 少しCPUを譲る。
+    dly_tsk(10*MSEC);
   }
 }
 #endif
@@ -289,20 +458,14 @@ int steering_rot( int _steer, int _pwr, float rot, brake_t brake)
  */  
 int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
 {
-  int ercd;
+  int ercd = E_OK;
   int l_pwr, r_pwr;
   int pwr, steer, diff;
   int abs_degree, target_l, target_r;
-
 #ifdef UTIL_EV3
-  int l_deg, r_deg;
-  // Mモーターでステアリングを行う場合、左が反時計、右が時計回りになるのを考慮する
-  if (ev3_motor_get_type(_MtrL) == MEDIUM_MOTOR)
-    l_deg = -deg;
-  else
-    l_deg = deg;
-  r_deg = deg;
+  int l_sign;
 #endif
+
   pwr = limit_100(_pwr);
   steer = limit_100(_steer);
 
@@ -316,18 +479,6 @@ int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
     r_pwr = pwr;
     l_pwr = limit_abs(pwr - diff, pwr);
   }
-  
-#ifdef UTIL_EV3
-  // EV3: パワーマイナスの場合は、API未対応なので回転角度をマイナスにする
-  if (l_pwr < 0){
-    l_pwr *= -1;
-    l_deg *= -1;
-  }
-  if (r_pwr < 0){
-    r_pwr *= -1;
-    r_deg *= -1;
-  }
-#endif
 
   abs_degree = abs(deg);
 #ifdef UTIL_SPIKE
@@ -339,6 +490,14 @@ int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
   target_r = (r_pwr > 0) ? abs_degree : (r_pwr < 0) ? -abs_degree : 0;
 
   spike_printf("steering_deg %d pow:%d(%d %d) deg:%d (%d %d) %d\n",steer, pwr, l_pwr, r_pwr, deg,target_l, target_r,  brake);
+#else
+  // EV3: Mモーターは左右が鏡写しの取り付けなので、左だけ符号反転すると
+  // 「+が前進」に揃う(ev3_motor_steerが内部でやっている補正と同じ)。
+  l_sign = (ev3_motor_get_type(_MtrL) == MEDIUM_MOTOR) ? -1 : 1;
+  ev3_motor_reset_counts(_MtrL);
+  ev3_motor_reset_counts(_MtrR);
+  target_l = (l_pwr > 0) ? abs_degree : (l_pwr < 0) ? -abs_degree : 0;
+  target_r = (r_pwr > 0) ? abs_degree : (r_pwr < 0) ? -abs_degree : 0;
 #endif
 
   // 回転の規則
@@ -365,8 +524,14 @@ int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
     // 後処理。P制御で目標角度(±1度)まで追い込む。
     p_stop2(target_l, l_pwr, target_r, r_pwr, brake);
 #else
-    ercd = ev3_motor_rotate(_MtrL, l_deg, l_pwr, false);
-    ercd = ev3_motor_rotate(_MtrR, r_deg, r_pwr, true); // ブロッキング：Rモーターが指定角度動くまでここに留まる
+    // EV3: ev3_motor_rotate()は1輪ずつ独立した制御ループで動くため、
+    // 2回コールしても左右が同期せず、立ち上がりの個体差でわずかに
+    // 曲がってしまう。SPIKE版と同じ(1)ゆっくり立ち上がる(2)指定パワーで
+    // 巡航(3)P制御で追い込む、の3段階を共通のev3_ramp_drive()で行う。
+    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, l_sign);
+    ev3_printf("ramp end");
+    // (3) 後処理。P制御で目標角度(±1度)まで追い込む。
+    ev3_p_stop2(target_l, l_pwr, target_r, r_pwr, l_sign, brake);
 #endif
   }
   else {
@@ -399,11 +564,11 @@ int steering_degree(int _steer, int _pwr, int deg, brake_t brake)
       {
         if (brake == STOP_BRAKE){
           ev3_motor_stop(_MtrL, true);
-          ev3_motor_stop(_MtrL, true);
+          ev3_motor_stop(_MtrR, true);
         }
         else {
           ev3_motor_stop(_MtrL, false);
-          ev3_motor_stop(_MtrL, false);
+          ev3_motor_stop(_MtrR, false);
         }
         stop = true;
       }
@@ -460,20 +625,15 @@ int tank_degree(int _l_pwr, int _r_pwr, int degree)
 {
   int ercd = E_OK;
   int l_pwr, r_pwr;
-#ifdef UTIL_EV3
-  int l_deg, r_deg;
-  l_deg = degree;
-  r_deg = degree;
-#else
   int abs_degree = abs(degree);
+#ifdef UTIL_SPIKE
 # ifdef GIJI_DAIKEI_IDOU
   int abs_degree2 = abs(degree)*9/10;
-
 # else
   int abs_degree2 = abs_degree;
 # endif
-  int target_l, target_r;
 #endif
+  int target_l, target_r;
 
   // 動作しない設定の時はすぐリターン
   if (degree == 0 || (_l_pwr == 0 && _r_pwr == 0))
@@ -489,26 +649,17 @@ int tank_degree(int _l_pwr, int _r_pwr, int degree)
   l_pwr = limit_100(_l_pwr);
   r_pwr = limit_100(_r_pwr);
 
-#ifdef UTIL_EV3
-  // EV3のみ、パワーマイナスの場合はAPI未対応なので、回転角度をマイナスにする
-  if (l_pwr < 0){
-    l_pwr *= -1;
-    l_deg *= -1;
-  }
-  if (r_pwr < 0){
-    r_pwr *= -1;
-    r_deg *= -1;
-  }
-#endif
-
 #ifdef UTIL_SPIKE
   // 回転角度のリセット
   pup_motor_reset_count(motorL);
   pup_motor_reset_count(motorR);
+#else
+  ev3_motor_reset_counts(_MtrL);
+  ev3_motor_reset_counts(_MtrR);
+#endif
   // 各輪の目標角度（符号付き）。パワー0の輪は0度＝その場ホールド。
   target_l = (l_pwr > 0) ? abs_degree : (l_pwr < 0) ? -abs_degree : 0;
   target_r = (r_pwr > 0) ? abs_degree : (r_pwr < 0) ? -abs_degree : 0;
-#endif
 
   // 回転の規則
   // （1）パワーの絶対値が同じ時は、両方の角度（エンコーダー）が指定角度になるまで待つ。
@@ -537,10 +688,9 @@ int tank_degree(int _l_pwr, int _r_pwr, int degree)
     // 後処理。P制御で目標角度(±1度)まで追い込む。
     p_stop2(target_l, l_pwr, target_r, r_pwr, STOP_BRAKE);
 #else
-    // EV3の場合は、APIで角度を指定できるのでそのまま使う。
-    // 右輪はブロッキング処理にしてこの関数がすぐに抜けないようにする。
-    ercd = ev3_motor_rotate(_MtrL, l_deg, l_pwr, false);
-    ercd = ev3_motor_rotate(_MtrR, r_deg, r_pwr, true);
+    // EV3: (1)ゆっくり立ち上がる (2)指定パワーで巡航 (3)P制御で追い込む。
+    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, 1);
+    ev3_p_stop2(target_l, l_pwr, target_r, r_pwr, 1, STOP_BRAKE);
 #endif
   }
   // （2）パワーの絶対値があわない時＝どちらかの角度が先に指定の角度になったらモーター動作を止める。
@@ -569,8 +719,9 @@ int tank_degree(int _l_pwr, int _r_pwr, int degree)
     // 後処理。P制御で両輪を目標角度(±1度)まで追い込む。
     p_stop2(target_l, l_pwr, target_r, r_pwr, STOP_BRAKE);
 #else
-    ercd = ev3_motor_rotate(_MtrR, r_deg, r_pwr, false);
-    ercd = ev3_motor_rotate(_MtrL, l_deg, l_pwr, true);
+    // EV3: (1)ゆっくり立ち上がる (2)指定パワーで巡航 (3)P制御で追い込む。
+    ev3_ramp_drive(l_pwr, r_pwr, abs_degree * EV3_CRUISE_PCT / 100, 1);
+    ev3_p_stop2(target_l, l_pwr, target_r, r_pwr, 1, STOP_BRAKE);
 #endif
   }
   return ercd;
